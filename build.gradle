@@ -44,5 +44,5 @@ dependencies {
 	api project(path: ':android-module-core')
 
 	// Google billing purchase: in-app, subscribe
-	api 'com.android.billingclient:billing:4.1.0'
+	api 'com.android.billingclient:billing:5.0.0'
 }
