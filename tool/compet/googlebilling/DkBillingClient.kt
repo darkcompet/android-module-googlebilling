@@ -20,13 +20,17 @@ import com.android.billingclient.api.Purchase
 import com.android.billingclient.api.PurchaseHistoryResponseListener
 import com.android.billingclient.api.PurchasesResponseListener
 import com.android.billingclient.api.PurchasesUpdatedListener
+import com.android.billingclient.api.QueryProductDetailsParams
 import com.android.billingclient.api.SkuDetails
 import com.android.billingclient.api.SkuDetailsParams
 import tool.compet.core.BuildConfig
 import tool.compet.core.DkLogcats
+import tool.compet.core.DkLogs
 import tool.compet.core.DkRunner2
+import tool.compet.core.DkStrings
 import tool.compet.googlebilling.SecurityChecker.verifyPurchase
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.min
 
 /**
  * Client billing (in-app, subscribe) lifecycled with the app (not activity or fragment).
@@ -103,7 +107,8 @@ class DkBillingClient private constructor(context: Context) : PurchasesUpdatedLi
 		@MainThread
 		fun install(app: Context) = INSTANCE ?: DkBillingClient(app).also { INSTANCE = it }
 
-		val instance = INSTANCE!!
+		val instance
+			get() = INSTANCE!!
 	}
 
 	/**
@@ -171,46 +176,68 @@ class DkBillingClient private constructor(context: Context) : PurchasesUpdatedLi
 	/**
 	 * Purchase item (sku) with in-app type. When done, we callback at given `purchaseListener`.
 	 */
-	fun purchase(host: Activity?, sku: String) {
-		purchase(host, listOf(sku), BillingClient.ProductType.INAPP)
+	fun purchase(host: Activity, productId: String) {
+		purchaseOrSubscribe(host, listOf(productId), BillingClient.ProductType.INAPP)
 	}
 
 	/**
 	 * Subscribe item (sku). When done, we callback at given `purchaseListener`.
 	 */
-	fun subscribe(host: Activity?, sku: String) {
-		purchase(host, listOf(sku), BillingClient.ProductType.SUBS)
+	fun subscribe(host: Activity, productId: String) {
+		purchaseOrSubscribe(host, listOf(productId), BillingClient.ProductType.SUBS)
 	}
 
 	/**
-	 * Purchase item (sku). When done, we callback at given `purchaseListener`.
+	 * Purchase/Subscribe item (sku). When done, we callback at given `purchaseListener`.
 	 */
-	fun purchase(host: Activity?, sku: String, skuType: String?) {
-		purchase(host, listOf(sku), skuType)
+	fun purchaseOrSubscribe(host: Activity, productId: String, productType: String) {
+		purchaseOrSubscribe(host, listOf(productId), productType)
 	}
 
 	/**
-	 * Purchase item (sku). When done, we callback at given `purchaseListener`.
+	 * Purchase/Subscribe item (product). When done, we callback at given `purchaseListener`.
 	 *
-	 * @param skuType BillingClient.SkuType.INAPP or BillingClient.SkuType.SUBS
+	 * @param productType One of: BillingClient.ProductType.INAPP, BillingClient.ProductType.SUBS
 	 */
-	fun purchase(host: Activity?, skuList: List<String?>?, skuType: String?) {
+	fun purchaseOrSubscribe(host: Activity, productIds: List<String>, productType: String) {
 		scheduleTask {
-			val skuDetailsParams = SkuDetailsParams.newBuilder()
-				.setSkusList(skuList!!)
-				.setType(skuType!!)
-				.build()
+			val productDetailParams = mutableListOf<QueryProductDetailsParams.Product>().let { products ->
+				for (productId in productIds) {
+					products.add(
+						QueryProductDetailsParams.Product.newBuilder()
+							.setProductId(productId)
+							.setProductType(productType)
+							.build()
+					)
+				}
 
-			// It is required to query available skus before start billing flow params
-			billingClient.querySkuDetailsAsync(skuDetailsParams) { billingResult: BillingResult, skuDetailsList: List<SkuDetails?>? ->
-				if (billingResult.responseCode == BillingClient.BillingResponseCode.OK && skuDetailsList != null) {
-					for (skuDetails in skuDetailsList) {
+				QueryProductDetailsParams.newBuilder()
+					.setProductList(products)
+					.build()
+			}
+
+			// It is required to query available products before start billing flow params
+			billingClient.queryProductDetailsAsync(productDetailParams) { billingResult, productDetails ->
+				DkLogs.debug(this, "---> productDetails: ${DkStrings.join(',', productDetails.map { it.productId })}")
+
+				if (billingResult.responseCode == BillingClient.BillingResponseCode.OK) {
+					for (productDetail in productDetails) {
+						// Note that `subscriptionOfferDetails` can be null if it is an in-app product, not a subscription.
+						//val offerToken = productDetail.subscriptionOfferDetails?.get(selectedOfferIndex)?.offerToken ?: return
+
+						val productDetailsParamsList = listOf(
+							BillingFlowParams.ProductDetailsParams.newBuilder()
+								.setProductDetails(productDetail)
+								//.setOfferToken(offerToken)
+								.build()
+						)
+
 						val billingFlowParams = BillingFlowParams.newBuilder()
-							.setSkuDetails(skuDetails!!)
+							.setProductDetailsParamsList(productDetailsParamsList)
 							.build()
 
 						// Start purchase flow
-						billingClient.launchBillingFlow(host!!, billingFlowParams)
+						billingClient.launchBillingFlow(host, billingFlowParams)
 					}
 				}
 			}
@@ -332,7 +359,7 @@ class DkBillingClient private constructor(context: Context) : PurchasesUpdatedLi
 	fun isFeatureSupported(feature: String?): Boolean {
 		return billingClient.isFeatureSupported(feature!!).responseCode == BillingClient.BillingResponseCode.OK
 	}
-	// region: Private
+
 	/**
 	 * Run given task if connection is granted. Otherwise, retry start connection
 	 * and the execute it when we got connection successful callback.
@@ -396,23 +423,20 @@ class DkBillingClient private constructor(context: Context) : PurchasesUpdatedLi
 		// So after the first caller has changed default `false` value of setup-flag,
 		// other callers will got failed to lock since the setup-flag has been changed to `true`
 		if (BuildConfig.DEBUG) {
-			DkLogcats.info(this, "-----> Attempting acquire setup billing lock...")
+			DkLogcats.info(this, "Attempting acquire setup billing lock...")
 		}
 
 		// This needs at least 3 actions (read, if, write)
 		// but we can make them to atomic action, well done !
 		if (setupBillingInProgress.compareAndSet(false, true)) {
 			if (BuildConfig.DEBUG) {
-				DkLogcats.info(
-					this,
-					"-----> Yeah, succeed acquire setup billing lock -> startBillingConnectionWithExponentialRetry"
-				)
+				DkLogcats.info(this, "OK, acquired billing setup-lock -> startBillingConnectionWithExponentialRetry")
 			}
 			startBillingConnectionWithExponentialRetry()
 			return
 		}
 		if (BuildConfig.DEBUG) {
-			DkLogcats.info(this, "-----> Worked well, other caller has acquire setup billing lock.")
+			DkLogcats.info(this, "Worked well, other caller has acquire setup billing lock.")
 		}
 	}
 
@@ -463,7 +487,7 @@ class DkBillingClient private constructor(context: Context) : PurchasesUpdatedLi
 
 		// Double delay time to avoid spamming and reduce stress onto server
 		reconnectBillingServiceDelayMillis =
-			Math.min(reconnectBillingServiceDelayMillis shl 1, RECONNECT_BILLING_SERVICE_END_DELAY_MILLIS)
+			min(reconnectBillingServiceDelayMillis shl 1, RECONNECT_BILLING_SERVICE_END_DELAY_MILLIS)
 	}
 
 	private fun executePendingTasksLocked() {
@@ -502,5 +526,5 @@ class DkBillingClient private constructor(context: Context) : PurchasesUpdatedLi
 			DkLogcats.error(this, e)
 		}
 		return false
-	} // endregion: Private
+	}
 }
