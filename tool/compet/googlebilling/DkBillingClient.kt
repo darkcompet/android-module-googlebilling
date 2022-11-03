@@ -22,6 +22,7 @@ import com.android.billingclient.api.PurchasesResponseListener
 import com.android.billingclient.api.PurchasesUpdatedListener
 import com.android.billingclient.api.SkuDetails
 import com.android.billingclient.api.SkuDetailsParams
+import tool.compet.core.BuildConfig
 import tool.compet.core.DkLogcats
 import tool.compet.core.DkRunner2
 import tool.compet.googlebilling.SecurityChecker.verifyPurchase
@@ -97,21 +98,12 @@ class DkBillingClient private constructor(context: Context) : PurchasesUpdatedLi
 
 	companion object {
 		// This instance will bind with app-lifecycle
-		private var DEFAULT: DkBillingClient? = null
+		private var INSTANCE: DkBillingClient? = null
 
 		@MainThread
-		fun install(app: Context): DkBillingClient {
-			var ins = DEFAULT
-			if (ins == null) {
-				ins = DkBillingClient(app).also { DEFAULT = it }
-			}
-			return ins
-		}
+		fun install(app: Context) = INSTANCE ?: DkBillingClient(app).also { INSTANCE = it }
 
-		val default: DkBillingClient
-			get() {
-				return DEFAULT!!
-			}
+		val instance = INSTANCE!!
 	}
 
 	/**
@@ -152,15 +144,17 @@ class DkBillingClient private constructor(context: Context) : PurchasesUpdatedLi
 			return
 		}
 		try {
-			if (responseCode == BillingClient.BillingResponseCode.OK) {
-				val purchases = purchasesList ?: ArrayList()
-				purchaseListener!!.onPurchasesUpdated(purchases)
-			}
-			else if (responseCode == BillingClient.BillingResponseCode.USER_CANCELED) {
-				purchaseListener!!.onPurchaseCancelled()
-			}
-			else {
-				purchaseListener!!.onPurchaseFailed(responseCode)
+			when (responseCode) {
+				BillingClient.BillingResponseCode.OK -> {
+					val purchases = purchasesList ?: ArrayList()
+					purchaseListener!!.onPurchasesUpdated(purchases)
+				}
+				BillingClient.BillingResponseCode.USER_CANCELED -> {
+					purchaseListener!!.onPurchaseCancelled()
+				}
+				else -> {
+					purchaseListener!!.onPurchaseFailed(responseCode)
+				}
 			}
 		}
 		finally {
@@ -178,14 +172,14 @@ class DkBillingClient private constructor(context: Context) : PurchasesUpdatedLi
 	 * Purchase item (sku) with in-app type. When done, we callback at given `purchaseListener`.
 	 */
 	fun purchase(host: Activity?, sku: String) {
-		purchase(host, listOf(sku), BillingClient.SkuType.INAPP)
+		purchase(host, listOf(sku), BillingClient.ProductType.INAPP)
 	}
 
 	/**
 	 * Subscribe item (sku). When done, we callback at given `purchaseListener`.
 	 */
 	fun subscribe(host: Activity?, sku: String) {
-		purchase(host, listOf(sku), BillingClient.SkuType.SUBS)
+		purchase(host, listOf(sku), BillingClient.ProductType.SUBS)
 	}
 
 	/**
