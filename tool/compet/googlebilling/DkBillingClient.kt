@@ -13,21 +13,20 @@ import com.android.billingclient.api.AcknowledgePurchaseResponseListener
 import com.android.billingclient.api.BillingClient
 import com.android.billingclient.api.BillingClientStateListener
 import com.android.billingclient.api.BillingFlowParams
+import com.android.billingclient.api.BillingFlowParams.ProductDetailsParams
 import com.android.billingclient.api.BillingResult
 import com.android.billingclient.api.ConsumeParams
 import com.android.billingclient.api.ConsumeResponseListener
+import com.android.billingclient.api.ProductDetails
 import com.android.billingclient.api.Purchase
 import com.android.billingclient.api.PurchaseHistoryResponseListener
 import com.android.billingclient.api.PurchasesResponseListener
 import com.android.billingclient.api.PurchasesUpdatedListener
 import com.android.billingclient.api.QueryProductDetailsParams
-import com.android.billingclient.api.SkuDetails
-import com.android.billingclient.api.SkuDetailsParams
+import com.android.billingclient.api.QueryPurchaseHistoryParams
+import com.android.billingclient.api.QueryPurchasesParams
 import tool.compet.core.BuildConfig
 import tool.compet.core.DkLogcats
-import tool.compet.core.DkLogs
-import tool.compet.core.DkRunner2
-import tool.compet.core.DkStrings
 import tool.compet.googlebilling.SecurityChecker.verifyPurchase
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.min
@@ -43,7 +42,7 @@ import kotlin.math.min
 class DkBillingClient private constructor(context: Context) : PurchasesUpdatedListener {
 	private val billingClient: BillingClient
 
-	// Caller can set this to listen event when purchase has finished
+	// Caller MUST set this before start purchsae to listen purchase events
 	private var purchaseListener: PurchaseListener? = null
 
 	// By default, auto unset `puchaseListener` given from caller
@@ -53,7 +52,7 @@ class DkBillingClient private constructor(context: Context) : PurchasesUpdatedLi
 	private val setupBillingInProgress = AtomicBoolean()
 
 	// Holds pending tasks which be executed when connected
-	private val pendingTaskSet: MutableSet<Runnable> = LinkedHashSet()
+	private val pendingTasks: MutableSet<Runnable> = LinkedHashSet()
 
 	// Sometime we got failed when connect to billing service,
 	// by implement re-try connect to perform task, we need below reconnect delay duration
@@ -117,7 +116,7 @@ class DkBillingClient private constructor(context: Context) : PurchasesUpdatedLi
 	 *
 	 * By default, this will unset `purchaseListener` when `onPurchaseUpdated()` was called.
 	 */
-	fun setPurchaseListener(purchaseListener: PurchaseListener?) {
+	fun setPurchaseListener(purchaseListener: PurchaseListener) {
 		this.purchaseListener = purchaseListener
 	}
 
@@ -126,7 +125,7 @@ class DkBillingClient private constructor(context: Context) : PurchasesUpdatedLi
 	}
 
 	/**
-	 * Set `purchaseListener` to null to avoid unintentional callback from some where at app-scope.
+	 * Set `purchaseListener` to null to avoid unintentional callback from some where inside app.
 	 */
 	fun unsetPurchaseListener() {
 		purchaseListener = null
@@ -135,6 +134,7 @@ class DkBillingClient private constructor(context: Context) : PurchasesUpdatedLi
 	// Called when purchase flow has finished, we callback to caller at this time
 	override fun onPurchasesUpdated(billingResult: BillingResult, purchasesList: List<Purchase>?) {
 		val responseCode = billingResult.responseCode
+
 		if (BuildConfig.DEBUG) {
 			DkLogcats.info(
 				this,
@@ -144,31 +144,31 @@ class DkBillingClient private constructor(context: Context) : PurchasesUpdatedLi
 				purchasesList?.toString() ?: "Null"
 			)
 		}
+
+		val purchaseListener = this.purchaseListener
 		if (purchaseListener == null) {
-			DkLogcats.notice(this, "Maybe you forgot set purchase listener?, pls set it before launch billing flow !")
+			DkLogcats.warning(this, "Maybe you forgot set purchase listener?, pls set it before launch billing flow !")
 			return
 		}
+
 		try {
 			when (responseCode) {
 				BillingClient.BillingResponseCode.OK -> {
 					val purchases = purchasesList ?: ArrayList()
-					purchaseListener!!.onPurchasesUpdated(purchases)
+					purchaseListener.onPurchasesUpdated(purchases)
 				}
 				BillingClient.BillingResponseCode.USER_CANCELED -> {
-					purchaseListener!!.onPurchaseCancelled()
+					purchaseListener.onPurchaseCancelled()
 				}
 				else -> {
-					purchaseListener!!.onPurchaseFailed(responseCode)
+					purchaseListener.onPurchaseFailed(responseCode)
 				}
 			}
 		}
 		finally {
 			// Auto unset purchaseListener to avoid unintentional callback from some where
-			if (autoUnsetPurchaseListener) {
-				purchaseListener = null
-				if (BuildConfig.DEBUG) {
-					DkLogcats.notice(this, "Unset purchaseListener")
-				}
+			if (this.autoUnsetPurchaseListener) {
+				this.purchaseListener = null
 			}
 		}
 	}
@@ -200,6 +200,11 @@ class DkBillingClient private constructor(context: Context) : PurchasesUpdatedLi
 	 * @param productType One of: BillingClient.ProductType.INAPP, BillingClient.ProductType.SUBS
 	 */
 	fun purchaseOrSubscribe(host: Activity, productIds: List<String>, productType: String) {
+		// Must set listener before purchase
+		if (this.purchaseListener == null) {
+			throw Exception("Must set purchaseListener before start purchase")
+		}
+
 		scheduleTask {
 			val productDetailParams = mutableListOf<QueryProductDetailsParams.Product>().let { products ->
 				for (productId in productIds) {
@@ -218,15 +223,13 @@ class DkBillingClient private constructor(context: Context) : PurchasesUpdatedLi
 
 			// It is required to query available products before start billing flow params
 			billingClient.queryProductDetailsAsync(productDetailParams) { billingResult, productDetails ->
-				DkLogs.debug(this, "---> productDetails: ${DkStrings.join(',', productDetails.map { it.productId })}")
-
 				if (billingResult.responseCode == BillingClient.BillingResponseCode.OK) {
 					for (productDetail in productDetails) {
 						// Note that `subscriptionOfferDetails` can be null if it is an in-app product, not a subscription.
 						//val offerToken = productDetail.subscriptionOfferDetails?.get(selectedOfferIndex)?.offerToken ?: return
 
 						val productDetailsParamsList = listOf(
-							BillingFlowParams.ProductDetailsParams.newBuilder()
+							ProductDetailsParams.newBuilder()
 								.setProductDetails(productDetail)
 								//.setOfferToken(offerToken)
 								.build()
@@ -244,12 +247,12 @@ class DkBillingClient private constructor(context: Context) : PurchasesUpdatedLi
 		}
 	}
 
-	fun queryInAppPurchases(listener: PurchasesResponseListener) {
-		scheduleQueryPurchases(BillingClient.SkuType.INAPP, listener)
+	fun queryInAppPurchasesAsync(listener: PurchasesResponseListener) {
+		scheduleQueryPurchases(BillingClient.ProductType.INAPP, listener)
 	}
 
-	fun querySubscriptionPurchases(listener: PurchasesResponseListener) {
-		scheduleQueryPurchases(BillingClient.SkuType.SUBS, listener)
+	fun querySubscriptionPurchasesAsync(listener: PurchasesResponseListener) {
+		scheduleQueryPurchases(BillingClient.ProductType.SUBS, listener)
 	}
 
 	/**
@@ -259,8 +262,8 @@ class DkBillingClient private constructor(context: Context) : PurchasesUpdatedLi
 	 * Note that, caller should pass listener to hear result callback since
 	 * this method does NOT callback at given `purchaseListener` when construct.
 	 */
-	fun queryInAppPurchaseHistory(listener: PurchaseHistoryResponseListener) {
-		scheduleQueryPurchaseHistory(BillingClient.SkuType.INAPP, listener)
+	fun queryInAppPurchaseHistoryAsync(listener: PurchaseHistoryResponseListener) {
+		scheduleQueryPurchaseHistory(BillingClient.ProductType.INAPP, listener)
 	}
 
 	/**
@@ -275,7 +278,7 @@ class DkBillingClient private constructor(context: Context) : PurchasesUpdatedLi
 			DkLogcats.warning(this, "Skip query since subscription is not supported by this device.")
 			return
 		}
-		scheduleQueryPurchaseHistory(BillingClient.SkuType.SUBS, listener)
+		scheduleQueryPurchaseHistory(BillingClient.ProductType.SUBS, listener)
 	}
 
 	/**
@@ -284,63 +287,71 @@ class DkBillingClient private constructor(context: Context) : PurchasesUpdatedLi
 	 * Note that, caller should pass listener to hear result callback since
 	 * this method does NOT callback at given `purchaseListener`.
 	 *
-	 * @param skuType  BillingClient.SkuType.INAPP or BillingClient.SkuType.SUBS
-	 * @param skuList  List of sku which you want to know.
-	 * @param callback Even though success or fail, callback will return NonNull list of SkuDetail
+	 * @param productType  BillingClient.SkuType.INAPP or BillingClient.SkuType.SUBS
+	 * @param productIds  List of sku which you want to know.
+	 * @param listener Even though success or fail, callback will return NonNull list of SkuDetail
 	 */
-	fun querySkuDetails(
-		skuType: String?,
-		skuList: List<String?>?,
-		callback: DkRunner2<BillingResult?, List<SkuDetails?>?>?
+	fun queryProductDetailsAsync(
+		productType: String,
+		productIds: List<String>,
+		listener: (billingResult: BillingResult, productDetails: List<ProductDetails>) -> Unit
 	) {
 		scheduleTask {
-			val skuDetailsParams = SkuDetailsParams.newBuilder()
-				.setSkusList(skuList!!)
-				.setType(skuType!!)
-				.build()
-			billingClient.querySkuDetailsAsync(skuDetailsParams) { billingResult: BillingResult?, skuDetailsList: List<SkuDetails?>? ->
-				callback?.run(
-					billingResult,
-					skuDetailsList
-				)
+			val productDetailParams = mutableListOf<QueryProductDetailsParams.Product>().let { products ->
+				for (productId in productIds) {
+					products.add(
+						QueryProductDetailsParams.Product.newBuilder()
+							.setProductId(productId)
+							.setProductType(productType)
+							.build()
+					)
+				}
+
+				QueryProductDetailsParams.newBuilder()
+					.setProductList(products)
+					.build()
 			}
+			billingClient.queryProductDetailsAsync(productDetailParams, listener)
 		}
 	}
 
 	/**
-	 * NOTE: A purchase will be refunded if you don’t acknowledge it within three days.
-	 *
 	 * Consume a consumable item via purchase token to acknowledge the purchase.
 	 * After consumed succeed, the item will be re-purchase again.
-	 * It is called as `one-time` purchase, and it is useful when we own point-system
-	 * which has own items that are exchangeable with purchase item.
 	 *
-	 * Note that, caller should pass listener to hear result callback since
-	 * this method does NOT callback at given `purchaseListener`.
+	 * For consumable (in-app) product, call consumeAsync() is to remove the data in Google side.
+	 * So when trigger queryPurchase() should be no record for that.
+	 *
+	 * Both `consumeAsync()` and `acknowledgePurchase()` also will set the payment to done.
+	 * If didn't trigger anyone of them, then it will auto refund after 3 days.
+	 * Both of the action also work as acknowledge the payment.
 	 */
-	fun consume(purchaseToken: String?, listener: ConsumeResponseListener?) {
+	fun consumeAsync(purchaseToken: String, listener: ConsumeResponseListener) {
 		scheduleTask {
 			val consumeParams = ConsumeParams.newBuilder()
-				.setPurchaseToken(purchaseToken!!)
+				.setPurchaseToken(purchaseToken)
 				.build()
-			billingClient.consumeAsync(consumeParams, listener!!)
+
+			billingClient.consumeAsync(consumeParams, listener)
 		}
 	}
 
 	/**
-	 * NOTE: A purchase will be refunded if you don’t acknowledge it within three days.
+	 * For non-consumable (subs) product, call acknowledgePurchase() is to set the purchase record to
+	 * acknowledged in Google side. So when you trying to trigger queryPurchase(), it will
+	 * show the product is purchased with acknowledged.
 	 *
-	 * Acknowledge a non-consumable item via purchase token.
-	 *
-	 * Note that, caller should pass listener to hear result callback since
-	 * this method does NOT callback at given `purchaseListener`.
+	 * Both `consumeAsync()` and `acknowledgePurchase()` also will set the payment to done.
+	 * If didn't trigger anyone of them, then it will auto refund after 3 days.
+	 * Both of the action also work as acknowledge the payment.
 	 */
-	fun acknowledge(purchaseToken: String?, listener: AcknowledgePurchaseResponseListener?) {
+	fun acknowledgePurchaseAsync(purchaseToken: String, listener: AcknowledgePurchaseResponseListener) {
 		scheduleTask {
 			val consumeParams = AcknowledgePurchaseParams.newBuilder()
-				.setPurchaseToken(purchaseToken!!)
+				.setPurchaseToken(purchaseToken)
 				.build()
-			billingClient.acknowledgePurchase(consumeParams, listener!!)
+
+			billingClient.acknowledgePurchase(consumeParams, listener)
 		}
 	}
 
@@ -348,7 +359,7 @@ class DkBillingClient private constructor(context: Context) : PurchasesUpdatedLi
 	 * Check current billing client has connected or not.
 	 * If connected, we can begin to execute tasks.
 	 */
-	val isConnected: Boolean
+	val isConnected
 		get() = billingClient.isReady
 
 	/**
@@ -391,52 +402,28 @@ class DkBillingClient private constructor(context: Context) : PurchasesUpdatedLi
 			// Because when billing setup complete, it executes pending tasks in synchronized
 			// block. That action maybe run before below lock-acquire, it will lead to problem
 			// when this task will not be executed !
-			synchronized(pendingTaskSet) {
-				pendingTaskSet.add(task)
+			synchronized(pendingTasks) {
+				pendingTasks.add(task)
 
 				// When we have acquired lock, we need check connection again since maybe connection
 				// has established by other caller.
 				// If connected, just execute pending tasks which included given task.
 				if (isConnected) {
 					if (BuildConfig.DEBUG) {
-						DkLogcats.notice(this, "-----> WOW, this is rarely but happened !, just execute pending tasks")
+						DkLogcats.notice(this, "This is rarely but happened ! Just execute pending tasks")
 					}
 					executePendingTasksLocked()
 				}
 			}
 		}
 
-		// Multiple of calling `billingClient.startConnection()` will cause failure,
-		// to avoid that problem, we allow only first caller setup billing.
-
-		// If we do as below, we will get incorrect implementation since
-		// suppose the first caller pass the `if` condition, then other callers maybe can pass
-		// the `if` condition before the first caller is trying to set the setup-flag to true
-		// at next line !
-		// if (setupBillingInProgress.get()) {
-		//		return;
-		// }
-		// setupBillingInProgress.set(true);
-
-		// Lock by first caller !
-		// By do with it, we make 2 actions at atomic,
-		// So after the first caller has changed default `false` value of setup-flag,
-		// other callers will got failed to lock since the setup-flag has been changed to `true`
-		if (BuildConfig.DEBUG) {
-			DkLogcats.info(this, "Attempting acquire setup billing lock...")
-		}
-
-		// This needs at least 3 actions (read, if, write)
-		// but we can make them to atomic action, well done !
+		// Multiple of calling `billingClient.startConnection()` will cause failure.
+		// To avoid that problem, we allow only first caller setup billing.
 		if (setupBillingInProgress.compareAndSet(false, true)) {
 			if (BuildConfig.DEBUG) {
-				DkLogcats.info(this, "OK, acquired billing setup-lock -> startBillingConnectionWithExponentialRetry")
+				DkLogcats.info(this, "Onetime acquired billing setup-lock -> Start billing connection")
 			}
 			startBillingConnectionWithExponentialRetry()
-			return
-		}
-		if (BuildConfig.DEBUG) {
-			DkLogcats.info(this, "Worked well, other caller has acquire setup billing lock.")
 		}
 	}
 
@@ -455,7 +442,7 @@ class DkBillingClient private constructor(context: Context) : PurchasesUpdatedLi
 					reconnectBillingServiceDelayMillis = RECONNECT_BILLING_SERVICE_START_DELAY_MILLIS
 
 					// Notify all pending callbacks known that connection has been established
-					synchronized(pendingTaskSet) { // wait a time for sync
+					synchronized(pendingTasks) {
 						executePendingTasksLocked()
 					}
 				}
@@ -491,26 +478,38 @@ class DkBillingClient private constructor(context: Context) : PurchasesUpdatedLi
 	}
 
 	private fun executePendingTasksLocked() {
-		for (pendingTask in pendingTaskSet) {
+		for (pendingTask in pendingTasks) {
 			pendingTask.run()
 		}
-		pendingTaskSet.clear()
+		pendingTasks.clear()
 	}
 
 	/**
-	 * @param skuType BillingClient.SkuType.*
+	 * @param productType BillingClient.ProductType.*
 	 * @param listener Result callback when complete.
 	 */
-	private fun scheduleQueryPurchases(skuType: String, listener: PurchasesResponseListener) {
-		scheduleTask { billingClient.queryPurchasesAsync(skuType, listener) }
+	private fun scheduleQueryPurchases(productType: String, listener: PurchasesResponseListener) {
+		scheduleTask {
+			val queryPurchaseParams = QueryPurchasesParams.newBuilder()
+				.setProductType(productType)
+				.build()
+
+			billingClient.queryPurchasesAsync(queryPurchaseParams, listener)
+		}
 	}
 
 	/**
-	 * @param skuType BillingClient.SkuType.*
+	 * @param productType BillingClient.ProductType.*
 	 * @param listener Result callback when complete.
 	 */
-	private fun scheduleQueryPurchaseHistory(skuType: String, listener: PurchaseHistoryResponseListener) {
-		scheduleTask { billingClient.queryPurchaseHistoryAsync(skuType, listener) }
+	private fun scheduleQueryPurchaseHistory(productType: String, listener: PurchaseHistoryResponseListener) {
+		scheduleTask {
+			val queryPurchaseHistoryParams = QueryPurchaseHistoryParams.newBuilder()
+				.setProductType(productType)
+				.build()
+
+			billingClient.queryPurchaseHistoryAsync(queryPurchaseHistoryParams, listener)
+		}
 	}
 
 	/**
